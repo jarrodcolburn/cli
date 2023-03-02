@@ -12,7 +12,7 @@ import { createDockerParams, createLog, experimentalImageMetadataDefault, launch
 import { SubstitutedConfig, createContainerProperties, createFeaturesTempFolder, envListToObj, inspectDockerImage, isDockerFileConfig, SubstituteConfig, addSubstitution, findContainerAndIdLabels } from './utils';
 import { URI } from 'vscode-uri';
 import { ContainerError } from '../spec-common/errors';
-import { Log, LogLevel, makeLog, mapLogLevel } from '../spec-utils/log';
+import { Log, LogDimensions, LogLevel, makeLog, mapLogLevel } from '../spec-utils/log';
 import { probeRemoteEnv, runPostCreateCommands, runRemoteCommand, UserEnvProbe, setupInContainer } from '../spec-common/injectHeadless';
 import { bailOut, buildNamedImageAndExtend } from './singleContainer';
 import { extendImage } from './containerFeatures';
@@ -23,7 +23,7 @@ import { workspaceFromPath } from '../spec-utils/workspaces';
 import { readDevContainerConfigFile } from './configContainer';
 import { getDefaultDevContainerConfigPath, getDevContainerConfigPathIn, uriToFsPath } from '../spec-configuration/configurationCommonUtils';
 import { getCLIHost } from '../spec-common/cliHost';
-import { loadNativeModule } from '../spec-common/commonUtils';
+import { loadNativeModule, processSignals } from '../spec-common/commonUtils';
 import { FeaturesConfig, generateFeaturesConfig, getContainerFeaturesFolder } from '../spec-configuration/containerFeaturesConfiguration';
 import { featuresTestOptions, featuresTestHandler } from './featuresCLI/test';
 import { featuresPackageHandler, featuresPackageOptions } from './featuresCLI/package';
@@ -35,6 +35,7 @@ import { getDevcontainerMetadata, getImageBuildInfo, getImageMetadataFromContain
 import { templatesPublishHandler, templatesPublishOptions } from './templatesCLI/publish';
 import { templateApplyHandler, templateApplyOptions } from './templatesCLI/apply';
 import { featuresInfoManifestHandler, featuresInfoManifestOptions } from './featuresCLI/infoManifest';
+import { Event, NodeEventEmitter } from '../spec-utils/event';
 
 const defaultDefaultUserEnvProbe: UserEnvProbe = 'loginInteractiveShell';
 
@@ -1033,7 +1034,6 @@ function execOptions(y: Argv) {
 		'config': { type: 'string', description: 'devcontainer.json path. The default is to use .devcontainer/devcontainer.json or, if that does not exist, .devcontainer.json in the workspace folder.' },
 		'override-config': { type: 'string', description: 'devcontainer.json path to override any devcontainer.json in the workspace folder (or built-in configuration). This is required when there is no devcontainer.json otherwise.' },
 		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level for the --terminal-log-file. When set to trace, the log level for --log-file will also be set to trace.' },
-		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
 		'terminal-columns': { type: 'number', implies: ['terminal-rows'], description: 'Number of rows to render the output for. This is required for some of the subprocesses to correctly render their output.' },
 		'terminal-rows': { type: 'number', implies: ['terminal-columns'], description: 'Number of columns to render the output for. This is required for some of the subprocesses to correctly render their output.' },
 		'default-user-env-probe': { choices: ['none' as 'none', 'loginInteractiveShell' as 'loginInteractiveShell', 'interactiveShell' as 'interactiveShell', 'loginShell' as 'loginShell'], default: defaultDefaultUserEnvProbe, description: 'Default value for the devcontainer.json\'s "userEnvProbe".' },
@@ -1075,8 +1075,9 @@ function execHandler(args: ExecArgs) {
 
 async function exec(args: ExecArgs) {
 	const result = await doExec(args);
-	const exitCode = result.outcome === 'error' ? 1 : 0;
-	console.log(JSON.stringify(result));
+	const exitCode = typeof result.code === 'number' && (result.code || !result.signal) ? result.code :
+		typeof result.signal === 'number' && result.signal > 0 ? 128 + result.signal : // 128 + signal number convention: https://tldp.org/LDP/abs/html/exitcodes.html
+		typeof result.signal === 'string' && processSignals[result.signal] ? 128 + processSignals[result.signal]! : 1;
 	await result.dispose();
 	process.exit(exitCode);
 }
@@ -1094,7 +1095,6 @@ export async function doExec({
 	config: configParam,
 	'override-config': overrideConfig,
 	'log-level': logLevel,
-	'log-format': logFormat,
 	'terminal-rows': terminalRows,
 	'terminal-columns': terminalColumns,
 	'default-user-env-probe': defaultUserEnvProbe,
@@ -1107,6 +1107,7 @@ export async function doExec({
 	const dispose = async () => {
 		await Promise.all(disposables.map(d => d()));
 	};
+	let output: Log | undefined;
 	try {
 		const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
 		const providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
@@ -1123,9 +1124,10 @@ export async function doExec({
 			configFile,
 			overrideConfigFile,
 			logLevel: mapLogLevel(logLevel),
-			logFormat,
+			logFormat: 'text',
 			log: text => process.stderr.write(text),
-			terminalDimensions: terminalColumns && terminalRows ? { columns: terminalColumns, rows: terminalRows } : undefined,
+			terminalDimensions: terminalColumns && terminalRows ? { columns: terminalColumns, rows: terminalRows } : process.stdout.isTTY ? { columns: process.stdout.columns, rows: process.stdout.rows } : undefined,
+			onDidChangeTerminalDimensions: terminalColumns && terminalRows ? undefined : process.stdout.isTTY ? createStdoutResizeEmitter(disposables) : undefined,
 			defaultUserEnvProbe,
 			removeExistingContainer: false,
 			buildNoCache: false,
@@ -1151,7 +1153,8 @@ export async function doExec({
 		}, disposables);
 
 		const { common } = params;
-		const { cliHost, output } = common;
+		const { cliHost } = common;
+		output = common.output;
 		const workspace = workspaceFolder ? workspaceFromPath(cliHost.path, workspaceFolder) : undefined;
 		const configPath = configFile ? configFile : workspace
 			? (await getDevContainerConfigPathIn(cliHost, workspace.configFolderPath)
@@ -1178,29 +1181,39 @@ export async function doExec({
 		const updatedConfig = containerSubstitute(cliHost.platform, config.config.configFilePath, containerProperties.env, mergedConfig);
 		const remoteEnv = probeRemoteEnv(common, containerProperties, updatedConfig);
 		const remoteCwd = containerProperties.remoteWorkspaceFolder || containerProperties.homeFolder;
-		const infoOutput = makeLog(output, LogLevel.Info);
-		await runRemoteCommand({ ...common, output: infoOutput }, containerProperties, restArgs || [], remoteCwd, { remoteEnv: await remoteEnv, print: 'continuous' });
-
+		await runRemoteCommand({ ...common, output, stdin: process.stdin, stdout: process.stdout, stderr: process.stderr }, containerProperties, restArgs || [], remoteCwd, { remoteEnv: await remoteEnv, pty: process.stdout.isTTY, print: 'continuous' });
 		return {
-			outcome: 'success' as 'success',
+			code: 0,
 			dispose,
 		};
 
-	} catch (originalError) {
-		const originalStack = originalError?.stack;
-		const err = originalError instanceof ContainerError ? originalError : new ContainerError({
-			description: 'An error occurred running a command in the container.',
-			originalError
-		});
-		if (originalStack) {
-			console.error(originalStack);
+	} catch (err) {
+		if (!err?.code && !err?.signal) {
+			if (output) {
+				output.write(err?.stack || err?.message || String(err), LogLevel.Error);
+			} else {
+				console.error(err?.stack || err?.message || String(err));
+			}
 		}
 		return {
-			outcome: 'error' as 'error',
-			message: err.message,
-			description: err.description,
-			containerId: err.containerId,
+			code: err?.code as number | undefined,
+			signal: err?.signal as string | number | undefined,
 			dispose,
 		};
 	}
+}
+
+function createStdoutResizeEmitter(disposables: (() => Promise<unknown> | void)[]): Event<LogDimensions> {
+	const resizeListener = () => {
+		emitter.fire({
+			rows: process.stdout.rows,
+			columns: process.stdout.columns
+		});
+	};
+	const emitter = new NodeEventEmitter<LogDimensions>({
+		on: () => process.stdout.on('resize', resizeListener),
+		off: () => process.stdout.off('resize', resizeListener),
+	});
+	disposables.push(() => emitter.dispose());
+	return emitter.event;
 }
